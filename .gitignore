@@ -24,8 +24,6 @@ var/
 *.egg
 
 # PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
 
@@ -49,6 +47,7 @@ coverage.xml
 
 # Django stuff:
 *.log
+logs/
 
 # Sphinx documentation
 docs/_build/
@@ -56,28 +55,36 @@ docs/_build/
 # PyBuilder
 target/
 
-# DotEnv configuration
+# ---------- Secrets / env (stronger rules) ----------
 .env
+.env.*
+**/.env
+**/*.env
+.envrc
+secrets.*
+*.secret
 
-# Database
-*.db
-*.rdb
+# keep only templates
+!.env.example
+!**/.env.example
 
-# Pycharm
+# Database dumps / creds by accident
+*.sql
+*.sql.gz
+*.dump
+
+# IDEs
 .idea
-
-# VS Code
 .vscode/
 *.code-workspace
-
-# Spyder
 .spyproject/
 
 # Jupyter NB Checkpoints
 .ipynb_checkpoints/
 
-# Mac OS-specific storage files
+# OS files
 .DS_Store
+Thumbs.db
 
 # vim
 *.swp
@@ -86,11 +93,23 @@ target/
 # Mypy cache
 .mypy_cache/
 
-# Exclude virtual environment
+# Virtual envs
 .venv/
+venv/
 
-# Exclude trained models
+# Trained models
 /models/
 
-# exclude data from source control by default
-# /data/
+# ---------- Project data & local state ----------
+# keep a placeholder file if you want the folder tracked
+data/**
+!data/.keep
+
+# Docker / Postgres local volumes
+pgdata/
+**/pgdata/
+docker-data/
+postgres-data/
+**/postgres-data/
+tmp/
+*.pid
