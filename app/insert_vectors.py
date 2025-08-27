@@ -1,55 +1,109 @@
-from datetime import datetime
-
+# app/insert_vectors.py
+import os
+import math
+import uuid
+import logging
 import pandas as pd
-from database.vector_store import VectorStore
-from timescale_vector.client import uuid_from_time
+from dotenv import load_dotenv
 
-# Initialize VectorStore
-vec = VectorStore()
+# Make .env override any stale user/system vars
+load_dotenv(override=True)
 
-# Read the CSV file
-df = pd.read_csv("../data/faq_dataset.csv", sep=";")
+# Robust import regardless of how you run the script
+try:
+    from app.database.vector_store import VectorStore
+except ImportError:
+    from database.vector_store import VectorStore  # fallback
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Prepare data for insertion
-def prepare_record(row):
-    """Prepare a record for insertion into the vector store.
+# === CSV path (override via .env: CSV_PATH=C:\path\to\file.csv) ===
+CSV_PATH = os.getenv(
+    "CSV_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "data", "MFCG1_RCM136_06132024_008.csv"),
+)
+DATASET_TAG = os.path.basename(CSV_PATH)  # for selective deletes later
 
-    This function creates a record with a UUID version 1 as the ID, which captures
-    the current time or a specified time.
+def to_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
 
-    Note:
-        - By default, this function uses the current time for the UUID.
-        - To use a specific time:
-          1. Import the datetime module.
-          2. Create a datetime object for your desired time.
-          3. Use uuid_from_time(your_datetime) instead of uuid_from_time(datetime.now()).
+def main():
+    if not os.path.exists(CSV_PATH):
+        print(f"❌ CSV not found: {CSV_PATH}")
+        return
 
-        Example:
-            from datetime import datetime
-            specific_time = datetime(2023, 1, 1, 12, 0, 0)
-            id = str(uuid_from_time(specific_time))
+    print(f"📄 Loading CSV: {CSV_PATH}")
+    df_raw = pd.read_csv(CSV_PATH)
 
-        This is useful when your content already has an associated datetime.
-    """
-    content = f"Question: {row['question']}\nAnswer: {row['answer']}"
-    embedding = vec.get_embedding(content)
-    return pd.Series(
-        {
-            "id": str(uuid_from_time(datetime.now())),
-            "metadata": {
-                "category": row["category"],
-                "created_at": datetime.now().isoformat(),
-            },
-            "contents": content,
-            "embedding": embedding,
+    vec = VectorStore()
+
+    rows = []
+    total = len(df_raw)
+    print(f"🔍 Generating embeddings for {total} rows…")
+
+    for i, r in df_raw.iterrows():
+        # Map from your CSV headers
+        fault_id  = to_float(r.get("SYS_FaultID"))
+        fault_lvl = to_float(r.get("SYS_FaultLvl"))      # numeric (will also store as string)
+        fault_st  = to_float(r.get("SYS_FaultSt"))
+        debug_id  = to_float(r.get("Debug_FaultActiveID"))
+        ts        = str(r.get("Datetime") or "")
+
+        # Build retrieval text (include numeric level)
+        contents = (
+            f"⚠️ Active Fault Detected "
+            f"Fault ID: {int(fault_id) if fault_id is not None else 'NA'} "
+            f"Fault Level: {fault_lvl if fault_lvl is not None else 'NA'} "
+            f"Fault State: {fault_st if fault_st is not None else 'NA'} "
+            f"Debug_FaultActiveID: {debug_id if debug_id is not None else 'NA'} "
+            f"Timestamp: {ts}"
+        )
+
+        # One embedding per row
+        emb = vec.get_embedding(contents)
+
+        # Write BOTH a string and numeric level into metadata
+        meta = {
+            "row_index": i + 1,  # 1-based like Excel
+            "source": DATASET_TAG,
+
+            "fault_id": int(fault_id) if fault_id is not None and not math.isnan(fault_id) else None,
+            "fault_lvl": f"{fault_lvl:.1f}" if fault_lvl is not None and not math.isnan(fault_lvl) else None,  # string
+            "fault_lvl_num": fault_lvl,  # numeric for predicates (e.g., > 0)
+
+            "fault_st": fault_st,
+            "debug_fault_id": debug_id,
+            "timestamp": ts,
         }
-    )
 
+        rows.append({
+            "id": uuid.uuid4(),           # UUID primary key
+            "metadata": meta,             # JSONB
+            "contents": contents,         # TEXT
+            "embedding": emb,             # VECTOR(n)
+        })
 
-records_df = df.apply(prepare_record, axis=1)
+        if (i + 1) % 1000 == 0:
+            print(f"…processed {i+1}/{total}")
 
-# Create tables and insert data
-vec.create_tables()
-vec.create_index()  # DiskAnnIndex
-vec.upsert(records_df)
+    df = pd.DataFrame(rows, columns=["id", "metadata", "contents", "embedding"])
+    print(f"✅ Prepared {len(df)} records.")
+
+    print("🛠 Creating tables…")
+    vec.create_tables()  # your VectorStore will fall back to pgvector-only if vectorscale is missing
+
+    try:
+        print("🛠 Creating index…")
+        vec.create_index()  # ensures HNSW on embedding
+    except Exception as e:
+        print(f"⚠️ Index creation skipped: {e}")
+
+    print("📥 Inserting records…")
+    vec.upsert(df)
+    print("🎉 Done.")
+
+if __name__ == "__main__":
+    main()

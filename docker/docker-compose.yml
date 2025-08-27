@@ -1,8 +1,6 @@
-name: timescaledb
-
 services:
   timescaledb:
-    image: timescale/timescaledb-ha:pg16
+    image: timescale/timescaledb-ha:pg17
     container_name: timescaledb
     environment:
       - POSTGRES_DB=postgres

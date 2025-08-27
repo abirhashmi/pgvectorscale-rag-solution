@@ -1,80 +1,159 @@
-import logging
-import time
+# app/database/vector_store.py
+import logging, os, sys, time
 from typing import Any, List, Optional, Tuple, Union
 from datetime import datetime
 
+import psycopg2
 import pandas as pd
-from config.settings import get_settings
+from dotenv import load_dotenv
+
+# Load .env and override any stale OS/user vars
+load_dotenv(override=True)
+
 from openai import OpenAI
 from timescale_vector import client
-
+from config.settings import get_settings
 
 class VectorStore:
-    """A class for managing vector operations and database interactions."""
+    """Manage embeddings, storage, and similarity search against Timescale + pgvector."""
 
     def __init__(self):
-        """Initialize the VectorStore with settings, OpenAI client, and Timescale Vector client."""
+        """Initialize settings, OpenAI client, and Timescale Vector client."""
         self.settings = get_settings()
+
+        # ---- OpenAI ----
         self.openai_client = OpenAI(api_key=self.settings.openai.api_key)
         self.embedding_model = self.settings.openai.embedding_model
-        self.vector_settings = self.settings.vector_store
-        self.vec_client = client.Sync(
-            self.settings.database.service_url,
-            self.vector_settings.table_name,
-            self.vector_settings.embedding_dimensions,
-            time_partition_interval=self.vector_settings.time_partition_interval,
+
+        # ---- DB / table config (cached for fallbacks) ----
+        self.vector_settings = self.settings.vector_store  # keep for external callers
+        self.table_name: str = self.vector_settings.table_name
+        self.num_dimensions: int = self.vector_settings.embedding_dimensions
+        self.time_partition_interval = self.vector_settings.time_partition_interval
+
+        # Build DSN: **prefer ENV**, then settings
+        env_dsn = (
+            os.getenv("VECTOR_SERVICE_URL")
+            or os.getenv("DATABASE_URL")
+            or os.getenv("TIME_SCALE_SERVICE_URL")
+            or os.getenv("TIMESCALE_SERVICE_URL")
         )
+        settings_dsn = getattr(self.settings.database, "service_url", None)
 
-    def get_embedding(self, text: str) -> List[float]:
-        """
-        Generate embedding for the given text.
+        print(f"▶ raw .env URI:  {env_dsn}", file=sys.stderr)
+        print(f"▶ settings URI:  {settings_dsn}", file=sys.stderr)
 
-        Args:
-            text: The input text to generate an embedding for.
-
-        Returns:
-            A list of floats representing the embedding.
-        """
-        text = text.replace("\n", " ")
-        start_time = time.time()
-        embedding = (
-            self.openai_client.embeddings.create(
-                input=[text],
-                model=self.embedding_model,
+        self.service_url: str = env_dsn or settings_dsn
+        if not self.service_url:
+            raise RuntimeError(
+                "No DB DSN found. Set VECTOR_SERVICE_URL / DATABASE_URL / TIME_SCALE_SERVICE_URL "
+                "or provide database.service_url in your settings."
             )
-            .data[0]
-            .embedding
-        )
-        elapsed_time = time.time() - start_time
-        logging.info(f"Embedding generated in {elapsed_time:.3f} seconds")
-        return embedding
 
+        # cosine is typical for OpenAI embeddings
+        self.pgvector_ops = "vector_cosine_ops"
+
+        # Helpful to see which DSN is actually used at runtime
+        print(f"[VectorStore] Using DSN: {self.service_url}", file=sys.stderr)
+
+        # ---- Timescale Vector sync client (works fine without vectorscale) ----
+        self.vec_client = client.Sync(
+            self.service_url,
+            self.table_name,
+            self.num_dimensions,
+            time_partition_interval=self.time_partition_interval,
+        )
+
+    # --------------------------
+    # Embeddings
+    # --------------------------
+    def get_embedding(self, text: str) -> List[float]:
+        """Return an embedding for the given text."""
+        text = text.replace("\n", " ")
+        start = time.time()
+        resp = self.openai_client.embeddings.create(input=[text], model=self.embedding_model)
+        emb = resp.data[0].embedding
+        logging.info("Embedding generated in %.3f seconds", time.time() - start)
+        return emb
+
+    # --------------------------
+    # Table / Index management
+    # --------------------------
     def create_tables(self) -> None:
-        """Create the necessary tablesin the database"""
-        self.vec_client.create_tables()
+        """
+        Try the library helper (which may attempt vectorscale). If that fails due to
+        'vectorscale' not being installed, fall back to a plain pgvector schema + HNSW index.
+        """
+        try:
+            self.vec_client.create_tables()
+            return
+        except Exception as e:
+            if "vectorscale" not in str(e).lower():
+                # Not a vectorscale problem; surface it
+                raise
+
+        logging.warning("vectorscale not available; creating plain pgvector schema instead.")
+        with psycopg2.connect(self.service_url) as conn, conn.cursor() as cur:
+            # Ensure extensions
+            cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+            # Create table matching expected schema
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table_name} (
+                    id UUID PRIMARY KEY,
+                    metadata JSONB,
+                    contents TEXT,
+                    embedding VECTOR({self.num_dimensions}),
+                    created_at TIMESTAMPTZ DEFAULT now()
+                );
+                """
+            )
+
+            # Create ANN index using pgvector HNSW
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_hnsw
+                ON {self.table_name}
+                USING hnsw (embedding {self.pgvector_ops});
+                """
+            )
+            conn.commit()
 
     def create_index(self) -> None:
-        """Create the StreamingDiskANN index to spseed up similarity search"""
-        self.vec_client.create_embedding_index(client.DiskAnnIndex())
+        """(pgvector) Ensure an HNSW index exists on the embedding column."""
+        with psycopg2.connect(self.service_url) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_hnsw
+                ON {self.table_name}
+                USING hnsw (embedding {self.pgvector_ops});
+                """
+            )
+            conn.commit()
 
     def drop_index(self) -> None:
-        """Drop the StreamingDiskANN index in the database"""
-        self.vec_client.drop_embedding_index()
+        """Drop the HNSW index (pgvector)."""
+        with psycopg2.connect(self.service_url) as conn, conn.cursor() as cur:
+            cur.execute(f"DROP INDEX IF EXISTS {self.table_name}_embedding_hnsw;")
+            conn.commit()
 
+    # --------------------------
+    # Data ops
+    # --------------------------
     def upsert(self, df: pd.DataFrame) -> None:
         """
-        Insert or update records in the database from a pandas DataFrame.
-
-        Args:
-            df: A pandas DataFrame containing the data to insert or update.
-                Expected columns: id, metadata, contents, embedding
+        Insert or update records from a pandas DataFrame.
+        Expected columns: id, metadata, contents, embedding
         """
         records = df.to_records(index=False)
         self.vec_client.upsert(list(records))
-        logging.info(
-            f"Inserted {len(df)} records into {self.vector_settings.table_name}"
-        )
+        logging.info("Inserted %d records into %s", len(df), self.table_name)
 
+    # --------------------------
+    # Search
+    # --------------------------
     def search(
         self,
         query_text: str,
@@ -86,140 +165,74 @@ class VectorStore:
     ) -> Union[List[Tuple[Any, ...]], pd.DataFrame]:
         """
         Query the vector database for similar embeddings based on input text.
-
-        More info:
-            https://github.com/timescale/docs/blob/latest/ai/python-interface-for-pgvector-and-timescale-vector.md
-
-        Args:
-            query_text: The input text to search for.
-            limit: The maximum number of results to return.
-            metadata_filter: A dictionary or list of dictionaries for equality-based metadata filtering.
-            predicates: A Predicates object for complex metadata filtering.
-                - Predicates objects are defined by the name of the metadata key, an operator, and a value.
-                - Operators: ==, !=, >, >=, <, <=
-                - & is used to combine multiple predicates with AND operator.
-                - | is used to combine multiple predicates with OR operator.
-            time_range: A tuple of (start_date, end_date) to filter results by time.
-            return_dataframe: Whether to return results as a DataFrame (default: True).
-
-        Returns:
-            Either a list of tuples or a pandas DataFrame containing the search results.
-
-        Basic Examples:
-            Basic search:
-                vector_store.search("What are your shipping options?")
-            Search with metadata filter:
-                vector_store.search("Shipping options", metadata_filter={"category": "Shipping"})
-        
-        Predicates Examples:
-            Search with predicates:
-                vector_store.search("Pricing", predicates=client.Predicates("price", ">", 100))
-            Search with complex combined predicates:
-                complex_pred = (client.Predicates("category", "==", "Electronics") & client.Predicates("price", "<", 1000)) | \
-                               (client.Predicates("category", "==", "Books") & client.Predicates("rating", ">=", 4.5))
-                vector_store.search("High-quality products", predicates=complex_pred)
-        
-        Time-based filtering:
-            Search with time range:
-                vector_store.search("Recent updates", time_range=(datetime(2024, 1, 1), datetime(2024, 1, 31)))
         """
         query_embedding = self.get_embedding(query_text)
+        start = time.time()
 
-        start_time = time.time()
-
-        search_args = {
-            "limit": limit,
-        }
-
+        search_args = {"limit": limit}
         if metadata_filter:
             search_args["filter"] = metadata_filter
-
         if predicates:
             search_args["predicates"] = predicates
-
         if time_range:
             start_date, end_date = time_range
             search_args["uuid_time_filter"] = client.UUIDTimeRange(start_date, end_date)
 
         results = self.vec_client.search(query_embedding, **search_args)
-        elapsed_time = time.time() - start_time
+        logging.info("Vector search completed in %.3f seconds", time.time() - start)
 
-        logging.info(f"Vector search completed in {elapsed_time:.3f} seconds")
+        return self._create_dataframe_from_results(results) if return_dataframe else results
 
-        if return_dataframe:
-            return self._create_dataframe_from_results(results)
-        else:
-            return results
+    # alias used elsewhere in your code
+    query = search
 
+    # --------------------------
+    # Helpers
+    # --------------------------
     def _create_dataframe_from_results(
-        self,
-        results: List[Tuple[Any, ...]],
+        self, results: List[Tuple[Any, ...]]
     ) -> pd.DataFrame:
         """
-        Create a pandas DataFrame from the search results.
-
-        Args:
-            results: A list of tuples containing the search results.
-
-        Returns:
-            A pandas DataFrame containing the formatted search results.
+        Convert tuple results -> DataFrame with expanded metadata.
+        Library typically returns tuples like: (id, metadata, content, embedding, distance)
         """
-        # Convert results to DataFrame
-        df = pd.DataFrame(
-            results, columns=["id", "metadata", "content", "embedding", "distance"]
-        )
+        if not results:
+            return pd.DataFrame(columns=["id", "content", "distance"])
 
-        # Expand metadata column
-        df = pd.concat(
-            [df.drop(["metadata"], axis=1), df["metadata"].apply(pd.Series)], axis=1
-        )
+        # Name columns explicitly; adjust if your client returns a different tuple shape
+        cols = ["id", "metadata", "content", "embedding", "distance"]
+        df = pd.DataFrame(results, columns=cols)
 
-        # Convert id to string for better readability
-        df["id"] = df["id"].astype(str)
+        # Expand metadata JSON to top-level columns if present
+        if "metadata" in df.columns:
+            meta = df["metadata"].apply(lambda m: m or {})
+            df = pd.concat([df.drop(columns=["metadata"]), meta.apply(pd.Series)], axis=1)
+
+        # id to string for readability
+        if "id" in df.columns:
+            df["id"] = df["id"].astype(str)
 
         return df
 
+    # --------------------------
+    # Delete ops
+    # --------------------------
     def delete(
         self,
         ids: List[str] = None,
         metadata_filter: dict = None,
         delete_all: bool = False,
     ) -> None:
-        """Delete records from the vector database.
-
-        Args:
-            ids (List[str], optional): A list of record IDs to delete.
-            metadata_filter (dict, optional): A dictionary of metadata key-value pairs to filter records for deletion.
-            delete_all (bool, optional): A boolean flag to delete all records.
-
-        Raises:
-            ValueError: If no deletion criteria are provided or if multiple criteria are provided.
-
-        Examples:
-            Delete by IDs:
-                vector_store.delete(ids=["8ab544ae-766a-11ef-81cb-decf757b836d"])
-
-            Delete by metadata filter:
-                vector_store.delete(metadata_filter={"category": "Shipping"})
-
-            Delete all records:
-                vector_store.delete(delete_all=True)
-        """
+        """Delete records by IDs, metadata filter, or delete_all (choose exactly one)."""
         if sum(bool(x) for x in (ids, metadata_filter, delete_all)) != 1:
-            raise ValueError(
-                "Provide exactly one of: ids, metadata_filter, or delete_all"
-            )
+            raise ValueError("Provide exactly one of: ids, metadata_filter, or delete_all")
 
         if delete_all:
             self.vec_client.delete_all()
-            logging.info(f"Deleted all records from {self.vector_settings.table_name}")
+            logging.info("Deleted ALL records from %s", self.table_name)
         elif ids:
             self.vec_client.delete_by_ids(ids)
-            logging.info(
-                f"Deleted {len(ids)} records from {self.vector_settings.table_name}"
-            )
+            logging.info("Deleted %d records from %s", len(ids), self.table_name)
         elif metadata_filter:
             self.vec_client.delete_by_metadata(metadata_filter)
-            logging.info(
-                f"Deleted records matching metadata filter from {self.vector_settings.table_name}"
-            )
+            logging.info("Deleted records matching metadata filter from %s", self.table_name)

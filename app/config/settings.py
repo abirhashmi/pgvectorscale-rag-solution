@@ -3,17 +3,21 @@ import os
 from datetime import timedelta
 from functools import lru_cache
 from typing import Optional
+from pathlib import Path
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-load_dotenv(dotenv_path="./.env")
+# --- Load .env from project root ---
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
 
 def setup_logging():
     """Configure basic logging for the application."""
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
     )
 
 
@@ -58,6 +62,5 @@ class Settings(BaseModel):
 @lru_cache()
 def get_settings() -> Settings:
     """Create and return a cached instance of the Settings."""
-    settings = Settings()
     setup_logging()
-    return settings
+    return Settings()
