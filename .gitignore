@@ -1,3 +1,4 @@
+# ---------------- Python basics ----------------
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -5,9 +6,11 @@ __pycache__/
 # C extensions
 *.so
 
-# Distribution / packaging
+# ---------------- Packaging / build ----------------
 .Python
 env/
+venv/
+.venv/
 build/
 develop-eggs/
 dist/
@@ -31,77 +34,96 @@ var/
 pip-log.txt
 pip-delete-this-directory.txt
 
-# Unit test / coverage reports
+# ---------------- Test / coverage / tooling ----------------
 htmlcov/
 .tox/
+.nox/
 .coverage
 .coverage.*
 .cache
-nosetests.xml
+.pytest_cache/
+.hypothesis/
 coverage.xml
 *.cover
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
 
-# Translations
+# ---------------- Translations ----------------
 *.mo
 *.pot
 
-# Django stuff:
+# ---------------- Logs ----------------
 *.log
 logs/
 
-# Sphinx documentation
+# ---------------- Docs ----------------
 docs/_build/
 
-# PyBuilder
+# ---------------- Build tools ----------------
 target/
 
-# ---------- Secrets / env (stronger rules) ----------
-.env
-.env.*
-**/.env
-**/*.env
-.envrc
-secrets.*
-*.secret
-
-# keep only templates
-!.env.example
-!**/.env.example
-
-# Database dumps / creds by accident
-*.sql
-*.sql.gz
-*.dump
-
-# IDEs
+# ---------------- IDE / Editors ----------------
 .idea
 .vscode/
 *.code-workspace
 .spyproject/
 
-# Jupyter NB Checkpoints
+# ---------------- Notebooks ----------------
 .ipynb_checkpoints/
 
-# OS files
+# ---------------- OS files ----------------
 .DS_Store
 Thumbs.db
 
-# vim
+# ---------------- Editors (vim, etc.) ----------------
 *.swp
 *.swo
 
-# Mypy cache
-.mypy_cache/
+# ---------------- Secrets / env (strong rules) ----------------
+# Ignore any dotenv/secret-like files anywhere
+.env
+.env.*
+.envrc
+*.env
+**/.env
+**/*.env
+*.dotenv
+secrets.*
+*.secret
+*.secrets.*
 
-# Virtual envs
-.venv/
-venv/
+# Common key/cert formats
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
 
-# Trained models
+# Keep only templates/examples
+!.env.example
+!**/.env.example
+
+# ---------------- DB dumps / backups ----------------
+*.sql
+*.sql.gz
+*.dump
+*.bak
+*.backup
+
+# ---------------- Virtualenv and runtime ----------------
+.python-version
+
+# ---------------- Trained models ----------------
 /models/
 
-# ---------- Project data & local state ----------
-# keep a placeholder file if you want the folder tracked
+# ---------------- Project data & local state ----------------
+# All local data; keep placeholder if needed
 data/**
 !data/.keep
 
@@ -111,5 +133,10 @@ pgdata/
 docker-data/
 postgres-data/
 **/postgres-data/
+backups/
 tmp/
 *.pid
+
+# Top-level CSV exports (prevent accidental commits like copied query results)
+# Put tracked datasets under /data with explicit allow rules instead.
+*.csv
